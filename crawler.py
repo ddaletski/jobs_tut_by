@@ -1,3 +1,4 @@
+import sys
 import requests
 import re
 from lxml import etree
@@ -7,6 +8,9 @@ import time
 from random import random, choice
 import urllib.parse
 import logging
+from copy import deepcopy
+import hashlib
+import csv
 
 
 class Crawler():
@@ -19,6 +23,28 @@ class Crawler():
         self._verbose = verbose
         self._alerts = []
         self._logger = logging.getLogger(__name__)
+        self._visited = set()
+        self._active_workers = [0 for i in range(n_workers)]
+
+
+    def mark_working(self, worker_number):
+        with self._mutex:
+            self._active_workers[worker_number] = 1
+
+
+    def mark_idle(self, worker_number):
+        with self._mutex:
+            self._active_workers[worker_number] = 0
+
+
+    def is_working(self):
+        result = False
+
+        with self._mutex:
+            if sum(self._active_workers) > 0 or not self._tasks.empty():
+                result = True
+
+        return result
 
 
     def log(self, msg):
@@ -31,8 +57,24 @@ class Crawler():
             self._alerts.append(alert)
 
 
+    def add_vacancy(self, vacancy):
+        self.log(vacancy)
+        if self._mutex:
+            self._vacancies.append(vacancy)
+
+
     def add_to_queue(self, task):
-        self.log("adding task to queue:")
+        self.log("trying to add task to queue:")
+        if task['type'] == 'crawl':
+            md5 = hashlib.md5(task['url'].encode('utf-8')).hexdigest()
+            if md5 in self._visited:
+                self.log("visited, skipping task")
+                return
+            else:
+                self._visited.add(md5)
+                self.log("not visited, adding")
+
+
         self.log("- url: %s\n- type: %s" % (task['url'], task['type']))
         if not task.get('data'):
             task['data'] = {}
@@ -48,6 +90,13 @@ class Crawler():
             return urllib.parse.urljoin(prefix, url)
 
 
+    def get_category(self, task):
+        try:
+            return task.get('data').get('category')
+        except:
+            return None
+
+
     def join_cats(self, cat1, cat2):
         if cat1 and cat2:
             return " ->>> ".join(cat1.split(" ->>> ") + cat2.split(" ->>> "))
@@ -61,7 +110,7 @@ class Crawler():
 
     def level1(self, task):
         self.log("level1")
-        doc = etree.HTML(task['body'])
+        doc = task['doc'] if task.get('doc') is not None else etree.HTML(task['body'])
         cats = doc.xpath("//div[@class='index-work-in-industry']//li")
         for cat in cats:
             url = self.abs_url(task['url'], cat.xpath("./a/@href")[0])
@@ -74,15 +123,50 @@ class Crawler():
     def level2(self, task):
         self.log("level2")
         xpath = "//div[@class='bloko-toggle bloko-toggle_expand']//div[contains(@class, 'catalog__item')]"
-        doc = etree.HTML(task['body'])
+        doc = task['doc'] if task.get('doc') is not None else etree.HTML(task['body'])
         cats = doc.xpath(xpath)
         for cat in cats:
             url = self.abs_url(task['url'], cat.xpath("./a/@href")[0])
-            print(cat.xpath("./a/text()")[0])
+            self.log(cat.xpath("./a/text()")[0])
             name = cat.xpath("./a/text()")[0]
-            data = task['data']
+            data = deepcopy(task['data'])
             data['category'] = self.join_cats(data.get('category'), name)
             self.add_to_queue({'type': 'crawl', 'url': url, 'data': data})
+
+
+    def pagination(self, task):
+        self.log("pagination")
+        doc = task['doc'] if task.get('doc') is not None else etree.HTML(task['body'])
+        next_page = self.abs_url(task['url'], doc.xpath("//a[@data-qa='pager-next']/@href")[0])
+        self.add_to_queue({'type': 'crawl', 'url': next_page, 'data': task['data']})
+
+
+    def vacancies_list(self, task):
+        self.log("list")
+        doc = task['doc'] if task.get('doc') is not None else etree.HTML(task['body'])
+        vacancies = doc.xpath("//div[@class='search-result-item__head']/a/@href")
+        for vacancy_url in vacancies:
+            self.add_to_queue({'type': 'crawl', 'url': vacancy_url, 'data': task['data']})
+
+
+    def extractor(self, task):
+        self.log("extractor")
+        doc = task['doc'] if task.get('doc') is not None else etree.HTML(task['body'])
+        top_info = doc.xpath("//div[@class='b-vacancy-info']//td//text()")
+
+        vacancy = {
+            "title": doc.xpath("//h1[contains(@class, 'b-vacancy-title')]/text()")[0].strip(),
+            "company": doc.xpath("//div[@class='companyname']//text()")[0].strip(),
+            "salary": top_info[0].strip(),
+            "location": " ".join(top_info[1:-1]).strip(),
+            "experience": top_info[-1].strip(),
+            "skills": " |||| ".join(doc.xpath("//span[@data-qa='skills-element']//text()")),
+            "employment_type": doc.xpath("//span[@itemprop='employmentType']/text()")[0],
+            "workhours": doc.xpath("//span[@itemprop='workHours']/text()")[0],
+            "category": self.get_category(task)
+        }
+
+        self.add_vacancy(vacancy)
 
 
     def rules(self):
@@ -94,8 +178,21 @@ class Crawler():
             {
                 "pattern": ".*jobs.tut.by\/catalog\/[\w-]+\/?$",
                 "function": Crawler.level2
+            },
+            {
+                "pattern": ".*jobs.tut.by\/catalog(\/[\w-]+){2}\/?(\/page.*)?$",
+                "function": Crawler.pagination
+            },
+            {
+                "pattern": ".*jobs.tut.by\/catalog(\/[\w-]+){2}\/?(\/page.*)?$",
+                "function": Crawler.vacancies_list
+            },
+            {
+                "pattern": ".*\/vacancy\/\d+",
+                "function": Crawler.extractor
             }
         ]
+
 
     def UA(self):
         return choice([
@@ -106,20 +203,24 @@ class Crawler():
 
     def parse(self, task):
         self.log("parsing")
+
         try:
-            rule_applied = False
-            for rule in self.rules():
+            task['doc'] = etree.HTML(task['body'])
+        except:
+            pass
+
+        rule_applied = False
+        for rule in self.rules():
+            try:
                 if re.fullmatch(rule['pattern'], task['url']):
                     rule['function'](self, task)
                     rule_applied = True
-
-            if not rule_applied:
-                self.add_alert("no rules applied for url %s" % task['url'])
-
-        except Exception as e:
-            with self._mutex:
-                self._logger.exception(e)
+            except Exception as e:
                 self.add_alert(e)
+
+        if not rule_applied:
+            self.add_alert("no rules applied for url %s" % task['url'])
+
 
 
     def crawl(self, task):
@@ -139,13 +240,12 @@ class Crawler():
                 "data": task.get('data') or {}
              })
         except Exception as e:
-            with self._mutex:
-                self._logger.exception(e)
-                self.add_alert(e)
+            self.add_alert(e)
 
 
-    def do_task(self):
+    def do_task(self, worker_number):
         while self._running:
+            self.mark_working(worker_number)
             task = None
 
             try:
@@ -159,16 +259,20 @@ class Crawler():
                     self.parse(task)
                 elif task['type'] == 'crawl':
                     self.crawl(task)
-                    sleeptime = random() * 5 + 3
+                    sleeptime = random() * self._n_workers + 3
                     self.log("sleeping for %f secs" % sleeptime)
                     time.sleep(sleeptime)
                 else:
                     self.add_alert('unknown task type: %s' % task['type'])
 
             else:
+                self.mark_idle(worker_number)
                 sleeptime = 2
                 self.log("sleeping for %f secs" % sleeptime)
                 time.sleep(sleeptime)
+
+            self.mark_idle(worker_number)
+
 
 
     def start(self, task=None):
@@ -180,8 +284,7 @@ class Crawler():
             if self._running:
                 return
 
-            self._threads = [Thread(target=self.do_task)
-                             for i in range(self._n_workers)]
+            self._threads = [Thread(target=self.do_task, args=(i,)) for i in range(self._n_workers)]
 
             self._running = True
 
@@ -199,10 +302,21 @@ class Crawler():
 
 
 if __name__ == "__main__":
-    c = Crawler(True, 4)
-#    start_url = "https://jobs.tut.by"
-    start_url = "https://jobs.tut.by/catalog/Avtomobilnyj-biznes"
+    start_url = sys.argv[1]
+    outfile = sys.argv[2]
 
+    c = Crawler(False, 8)
     c.start({"type": "crawl", "url": start_url})
-    while True:
+
+    while c.is_working():
+        print("active workers: [%s]" % ", ".join(list(map(str, c._active_workers))))
         time.sleep(1)
+
+    c.stop()
+    print(c._alerts)
+
+    with open(outfile, 'w') as f:
+        fields = ['category', 'title', 'company', 'salary', 'location', 'experience', 'employment_type', 'workhours',  'skills']
+        writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t")
+        writer.writeheader()
+        writer.writerows(c._vacancies)
