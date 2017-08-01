@@ -1,5 +1,6 @@
 import sys
 import requests
+import progressbar
 import re
 from lxml import etree
 from queue import Queue, Empty
@@ -10,7 +11,9 @@ import urllib.parse
 import logging
 from copy import deepcopy
 import hashlib
+import math
 import csv
+import traceback
 
 
 class Crawler():
@@ -23,6 +26,7 @@ class Crawler():
         self._verbose = verbose
         self._alerts = []
         self._logger = logging.getLogger(__name__)
+        self._queued = set()
         self._visited = set()
         self._active_workers = [0 for i in range(n_workers)]
 
@@ -67,11 +71,11 @@ class Crawler():
         self.log("trying to add task to queue:")
         if task['type'] == 'crawl':
             md5 = hashlib.md5(task['url'].encode('utf-8')).hexdigest()
-            if md5 in self._visited:
+            if md5 in self._queued:
                 self.log("visited, skipping task")
                 return
             else:
-                self._visited.add(md5)
+                self._queued.add(md5)
                 self.log("not visited, adding")
 
 
@@ -215,8 +219,9 @@ class Crawler():
                 if re.fullmatch(rule['pattern'], task['url']):
                     rule['function'](self, task)
                     rule_applied = True
-            except Exception as e:
-                self.add_alert(e)
+            except Exception:
+                exc = sys.exc_info()
+                self.add_alert("".join(traceback.format_exception(*exc)))
 
         if not rule_applied:
             self.add_alert("no rules applied for url %s" % task['url'])
@@ -239,8 +244,11 @@ class Crawler():
                 "body": response.text,
                 "data": task.get('data') or {}
              })
-        except Exception as e:
-            self.add_alert(e)
+            md5 = hashlib.md5(task['url'].encode('utf-8')).hexdigest()
+            self._visited.add(md5)
+        except Exception:
+            exc = sys.exc_info()
+            self.add_alert("".join(traceback.format_exception(*exc)))
 
 
     def do_task(self, worker_number):
@@ -259,7 +267,7 @@ class Crawler():
                     self.parse(task)
                 elif task['type'] == 'crawl':
                     self.crawl(task)
-                    sleeptime = random() * self._n_workers + 3
+                    sleeptime = int(random() * self._n_workers / math.log(self._n_workers) + 3)
                     self.log("sleeping for %f secs" % sleeptime)
                     time.sleep(sleeptime)
                 else:
@@ -305,18 +313,33 @@ if __name__ == "__main__":
     start_url = sys.argv[1]
     outfile = sys.argv[2]
 
-    c = Crawler(False, 8)
+    bar = progressbar.ProgressBar(
+        max_value=math.inf,
+        widgets=[
+            ' (', progressbar.Counter(format=u'urls visited: %(value)d'), ') ',
+            ' [', progressbar.Timer(), '] ',
+        ]
+    )
+
+    c = Crawler(False, 16)
     c.start({"type": "crawl", "url": start_url})
 
-    while c.is_working():
-        print("active workers: [%s]" % ", ".join(list(map(str, c._active_workers))))
-        time.sleep(1)
+    try:
+        while c.is_working():
+            bar.update(len(c._visited))
+            time.sleep(1)
+    
+    except KeyboardInterrupt:
+        pass
 
-    c.stop()
-    print(c._alerts)
+    finally:
+        print("wait for crawler to exit")
+        c.stop()
+        print("alerts:", c._alerts)
+        with open(outfile, 'w') as f:
+            fields = ['category', 'title', 'company', 'salary', 'location', 'experience', 'employment_type', 'workhours',  'skills']
+            writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t")
+            writer.writeheader()
+            writer.writerows(c._vacancies)
 
-    with open(outfile, 'w') as f:
-        fields = ['category', 'title', 'company', 'salary', 'location', 'experience', 'employment_type', 'workhours',  'skills']
-        writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t")
-        writer.writeheader()
-        writer.writerows(c._vacancies)
+    
